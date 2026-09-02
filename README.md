@@ -14,6 +14,8 @@ It is the first cell of a larger idea: **turn Omarchy's window gaps into UI**.
 The screen edge is the easiest surface to prove it on, because it needs no
 per-window geometry tracking.
 
+![The Margin ring filling the gap around the screen edge, coloured from the current track's album art](docs/screenshot.png)
+
 ## Install
 
 ```bash
