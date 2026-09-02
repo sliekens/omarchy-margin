@@ -1,0 +1,22 @@
+{
+  "enabled": true,
+  "thickness": 0,
+  "floorRatio": 0.12,
+  "idleOpacity": 0,
+  "beatShiftsPalette": true,
+  "fallbackColors": [
+    "#7aa2f7",
+    "#bb9af7",
+    "#7dcfff",
+    "#9ece6a"
+  ],
+  "gamma": 1.0,
+  "samples": 160,
+  "angleOffset": 90,
+  "anchorToWindow": false,
+  "depth": 0,
+  "loudFull": 60,
+  "silenceHold": 1500,
+  "retractMs": 800,
+  "expandMs": 420
+}

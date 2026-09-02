@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""Margin audio producer.
+
+Taps the default sink's monitor with pw-cat, computes a log-spaced spectrum
+and a beat flag, and writes one compact JSON object per frame to stdout.
+
+Output (one line per frame, ~43/sec):
+  {"b":[0..100 x BANDS],"lvl":0..100,"beat":0|1,"bpm":0|60..200}
+
+Pure stdlib on purpose: this runs on a stock Omarchy box with nothing
+installed. See README for the cava swap, which is ~10x cheaper.
+"""
+
+import atexit
+import json
+import math
+import signal
+import shutil
+import struct
+import subprocess
+import sys
+import time
+
+_child = None
+
+
+def _reap(*_args):
+    """Kill the capture child on the way out.
+
+    Without this, every plugin reload orphans a pw-cat still holding the
+    monitor open, and they accumulate for the life of the session.
+    """
+    global _child
+    if _child and _child.poll() is None:
+        try:
+            _child.kill()
+            _child.wait(timeout=1)
+        except Exception:
+            pass
+    _child = None
+
+RATE = 22050
+N = 512                      # FFT size and hop: ~43 frames/sec
+BANDS = 28
+LO_HZ, HI_HZ = 40.0, 10000.0
+BASS_LO_HZ, BASS_HI_HZ = 40.0, 165.0
+
+TILT = 1.6                   # extra gain applied linearly toward the top band
+ATTACK = 0.55                # per-frame rise toward a louder value
+DECAY = 0.12                 # per-frame fall toward a quieter value
+PEAK_DECAY = 0.9993          # auto-gain reference bleeds down over ~30s
+SILENCE = 1e-4
+GATE_FLOOR = 0.25            # dBFS-scale point below which the ring fades out
+
+BEAT_HISTORY = 43            # ~1s of bass energy
+BEAT_SENSITIVITY = 2.8       # flux must beat this multiple of its median
+BEAT_REFRACTORY = 0.28       # seconds (caps detection near 210 BPM)
+BASS_DOMINANCE = 0.18        # min share of total energy in the low bins
+
+
+def hann(n):
+    return [0.5 - 0.5 * math.cos(2.0 * math.pi * i / (n - 1)) for i in range(n)]
+
+
+def fft(a):
+    """In-place iterative radix-2 FFT over a list of complex."""
+    n = len(a)
+    j = 0
+    for i in range(1, n):
+        bit = n >> 1
+        while j & bit:
+            j ^= bit
+            bit >>= 1
+        j |= bit
+        if i < j:
+            a[i], a[j] = a[j], a[i]
+    length = 2
+    while length <= n:
+        ang = -2.0 * math.pi / length
+        wl = complex(math.cos(ang), math.sin(ang))
+        half = length >> 1
+        for i in range(0, n, length):
+            w = 1 + 0j
+            for k in range(i, i + half):
+                u = a[k]
+                v = a[k + half] * w
+                a[k] = u + v
+                a[k + half] = u - v
+                w *= wl
+        length <<= 1
+    return a
+
+
+def band_edges():
+    """Log-spaced bin ranges, each at least one bin wide."""
+    edges = []
+    step = (math.log(HI_HZ) - math.log(LO_HZ)) / BANDS
+    prev = int(LO_HZ * N / RATE)
+    for i in range(1, BANDS + 1):
+        hz = math.exp(math.log(LO_HZ) + step * i)
+        end = min(int(hz * N / RATE), N // 2 - 1)
+        if end <= prev:
+            end = prev + 1
+        edges.append((prev, end))
+        prev = end
+    return edges
+
+
+def sink_node_id():
+    """PipeWire node id of the default sink.
+
+    There is no separate node for a monitor in PipeWire: you capture a sink's
+    monitor by targeting the sink itself. The `<sink>.monitor` name is a
+    PulseAudio-ism, and passing it to pw-cat does not match anything — pw-cat
+    then falls back to the DEFAULT SOURCE, which is the microphone. That is
+    both wrong and a privacy problem, so this resolves a real id or nothing.
+    """
+    try:
+        sink = subprocess.run(["pactl", "get-default-sink"], capture_output=True,
+                              text=True, timeout=3).stdout.strip()
+        if not sink:
+            return None, None
+        dump = json.loads(subprocess.run(["pw-dump"], capture_output=True,
+                                         text=True, timeout=5).stdout)
+        for obj in dump:
+            props = ((obj.get("info") or {}).get("props") or {})
+            if (props.get("media.class") == "Audio/Sink"
+                    and props.get("node.name") == sink):
+                return obj.get("id"), sink
+        return None, sink
+    except Exception:
+        return None, None
+
+
+def open_capture():
+    global _child
+    _reap()
+    node_id, sink = sink_node_id()
+    if node_id is not None:
+        cmd = ["pw-cat", "--record", "--target", str(node_id),
+               "--rate", str(RATE), "--channels", "1", "--format", "s16",
+               "--latency", "20ms", "--raw", "-"]
+    elif sink and shutil.which("parec"):
+        # parec resolves the PulseAudio monitor name directly.
+        cmd = ["parec", "--format=s16le", "--rate=%d" % RATE, "--channels=1",
+               "-d", sink + ".monitor"]
+    else:
+        # Deliberately fatal: capturing an unresolved default source would mean
+        # visualising the microphone. Better to show nothing than to do that.
+        sys.stderr.write("margin-audio: cannot resolve the default sink's "
+                         "monitor; refusing to capture an unknown source\n")
+        sys.exit(1)
+    _child = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL)
+    return _child
+
+
+def read_exact(stream, nbytes):
+    buf = b""
+    while len(buf) < nbytes:
+        chunk = stream.read(nbytes - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
+def main():
+    # --stdin reads raw s16le mono at RATE from stdin instead of the sink
+    # monitor. Used to validate beat detection against a known-BPM signal,
+    # and as the seam for swapping in another capture source.
+    use_stdin = "--stdin" in sys.argv
+    window = hann(N)
+    edges = band_edges()
+    bass_bins = (max(1, int(BASS_LO_HZ * N / RATE)), max(3, int(BASS_HI_HZ * N / RATE)))
+    unpack = struct.Struct("<%dh" % N).unpack_from
+
+    smoothed = [0.0] * BANDS
+    peak = 1e-3
+    history = []
+    prev_mag = [0.0] * (N // 2)
+    last_flux = 0.0
+    last_beat = 0.0
+    frames = 0
+    beat_times = []
+    bpm = 0
+
+    proc = None if use_stdin else open_capture()
+    source = sys.stdin.buffer if use_stdin else proc.stdout
+    while True:
+        raw = read_exact(source, N * 2)
+        if raw is None:                       # sink changed or pw-cat died
+            if use_stdin:
+                break
+            time.sleep(0.5)
+            proc = open_capture()
+            source = proc.stdout
+            continue
+
+        samples = unpack(raw)
+        buf = [complex(samples[i] * window[i] / 32768.0, 0.0) for i in range(N)]
+        fft(buf)
+        mag = [abs(buf[i]) for i in range(N // 2)]
+
+        # Per-band value, auto-gained against a slowly bleeding per-band peak so
+        # quiet passages still fill the ring rather than flatlining it.
+        raw = []
+        for i, (lo, hi) in enumerate(edges):
+            v = sum(mag[lo:hi]) / max(1, hi - lo)
+            v = math.sqrt(v)                  # perceptual-ish compression
+            # Music rolls off with frequency; tilt the top bands up so treble
+            # is visible without letting it dominate.
+            raw.append(v * (1.0 + TILT * (i / float(BANDS - 1))))
+
+        # One shared reference across all bands keeps the spectrum's shape:
+        # bass tall, treble short. Normalizing each band against its own peak
+        # (the previous approach) made every band hit full scale in turn.
+        peak = max(peak * PEAK_DECAY, max(raw), 1e-3)
+        out = []
+        for i, v in enumerate(raw):
+            norm = min(1.0, v / peak)
+            rate = ATTACK if norm > smoothed[i] else DECAY
+            smoothed[i] += (norm - smoothed[i]) * rate
+            out.append(smoothed[i])
+
+        rms = math.sqrt(sum(v * v for v in samples) / N) / 32768.0
+        # Map -60 dBFS..0 dBFS onto 0..100 so the ring tracks perceived loudness
+        # instead of pinning at full scale the moment anything plays.
+        level = 0.0 if rms < 1e-6 else max(0.0, (20.0 * math.log10(rms) + 60.0) / 60.0)
+        # Audio clock, not wall clock: the refractory window and BPM estimate
+        # should follow the samples we actually analysed, immune to processing
+        # jitter (and to running faster than realtime in --stdin mode).
+        frames += 1
+        now = frames * N / float(RATE)
+
+        # Noise gate. Auto-gain normalises against a decaying peak, so without
+        # this a near-silent stream (a paused player's dither, a very quiet
+        # passage) gets amplified into a full-scale display. Below GATE_FLOOR
+        # of the dBFS scale the ring is off; it fades in above that.
+        gate = min(1.0, level / GATE_FLOOR) if GATE_FLOOR > 0 else 1.0
+        out = [int(round(v * gate * 100)) for v in out]
+
+        # Onset detection by spectral flux over the bass bins: sum of the
+        # positive frame-to-frame change. A kick is a sudden rise in low-band
+        # energy, which flux sees clearly and raw energy does not (sustained
+        # bass keeps energy high but produces no flux).
+        flux = 0.0
+        for i in range(bass_bins[0], bass_bins[1]):
+            d = mag[i] - prev_mag[i]
+            if d > 0:
+                flux += d
+        prev_mag = mag
+
+        # A hi-hat or snare transient leaks energy into the low bins and will
+        # fake an onset. Require the frame's energy to actually be bass-heavy
+        # before it counts, which rejects the offbeat without touching kicks.
+        total = sum(mag) + 1e-9
+        bass_share = sum(mag[bass_bins[0]:bass_bins[1] + 2]) / total
+
+        beat = 0
+        if (len(history) >= 20 and rms > SILENCE and gate > 0.5
+                and bass_share > BASS_DOMINANCE):
+            # Median is the right centre here: a mean gets dragged up by the
+            # very onsets we are trying to stand out from.
+            ordered = sorted(history)
+            median = ordered[len(ordered) // 2]
+            if (flux > median * BEAT_SENSITIVITY and flux > last_flux
+                    and now - last_beat > BEAT_REFRACTORY):
+                beat = 1
+                if last_beat:
+                    beat_times.append(now - last_beat)
+                    del beat_times[:-8]
+                last_beat = now
+        last_flux = flux
+        history.append(flux)
+        if len(history) > BEAT_HISTORY:
+            history.pop(0)
+
+        if len(beat_times) >= 4:
+            ordered = sorted(beat_times)
+            median = ordered[len(ordered) // 2]
+            if 0.3 < median < 1.5:
+                bpm = int(round(60.0 / median))
+
+        if rms <= SILENCE:
+            out = [0] * BANDS
+            bpm = 0
+
+        line = json.dumps({"b": out, "lvl": min(100, int(round(level * 100))),
+                           "beat": beat, "bpm": bpm}, separators=(",", ":"))
+        try:
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+        except (BrokenPipeError, ValueError):
+            break
+
+
+if __name__ == "__main__":
+    atexit.register(_reap)
+    signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
+    signal.signal(signal.SIGHUP, lambda *a: sys.exit(0))
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

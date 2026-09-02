@@ -1,0 +1,5 @@
+# Local tuning. Every key has a built-in default in Margin.qml, so this file is
+# optional — and keeping it untracked matters: `omarchy plugin update` is a
+# `git merge --ff-only`, which would refuse to update once you edited a tracked
+# config. Copy config.example.json to config.json to override anything.
+config.json

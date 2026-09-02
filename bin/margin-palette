@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Extract a ring palette from an MPRIS album-art URL.
+
+usage: margin-palette <http(s)://... | file://... | /path>
+Prints {"colors":["#rrggbb", ...]} — 4 colors, most ring-worthy first.
+Exits 0 with an empty list rather than failing, so the ring can fall back
+to theme colors without special-casing errors in QML.
+"""
+
+import colorsys
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+import urllib.request
+
+SWATCHES = 8          # quantize to this many, then score them
+KEEP = 4
+MIN_LUM, MAX_LUM = 0.18, 0.95
+MIN_SAT = 0.10
+
+
+def fetch(src):
+    """Return a local path for src, or None. Caller owns cleanup of temps."""
+    if src.startswith("file://"):
+        return urllib.parse.unquote(urllib.parse.urlparse(src).path), False
+    if src.startswith("/"):
+        return src, False
+    if src.startswith("http://") or src.startswith("https://"):
+        fd, path = tempfile.mkstemp(prefix="margin-art-")
+        os.close(fd)
+        req = urllib.request.Request(src, headers={"User-Agent": "margin/0.1"})
+        with urllib.request.urlopen(req, timeout=6) as r, open(path, "wb") as f:
+            f.write(r.read(8 * 1024 * 1024))
+        return path, True
+    return None, False
+
+
+def swatches(path):
+    """(weight, r, g, b) per quantized color, via ImageMagick's histogram."""
+    out = subprocess.run(
+        # Quantize in LAB (perceptual clustering), then convert back to sRGB
+        # BEFORE reading the histogram — otherwise the tuples come out as LAB.
+        ["magick", path + "[0]", "-resize", "120x120>",
+         "-quantize", "LAB", "-colors", str(SWATCHES),
+         "-colorspace", "sRGB", "-depth", "8",
+         "-format", "%c", "histogram:info:-"],
+        capture_output=True, text=True, timeout=10).stdout
+    found = []
+    for line in out.splitlines():
+        m = re.search(r"^\s*(\d+):\s*\(\s*(\d+),\s*(\d+),\s*(\d+)", line)
+        if m:
+            found.append((int(m.group(1)), int(m.group(2)),
+                          int(m.group(3)), int(m.group(4))))
+    return found
+
+
+def score(found):
+    """Rank by how well a color will read as light on a dark screen edge:
+    saturated and mid-bright beats merely common."""
+    total = sum(w for w, _, _, _ in found) or 1
+    ranked = []
+    for w, r, g, b in found:
+        h, l, s = colorsys.rgb_to_hls(r / 255.0, g / 255.0, b / 255.0)
+        if not (MIN_LUM < l < MAX_LUM) or s < MIN_SAT:
+            continue
+        share = w / total
+        # Weight presence sublinearly: a big flat background shouldn't crowd
+        # out the one vivid color that gives the album its identity.
+        ranked.append((share ** 0.35 * (0.35 + s) * (0.6 + 0.8 * (1 - abs(l - 0.55) * 2)),
+                       h, l, s))
+    ranked.sort(reverse=True)
+    out = []
+    for _, h, l, s in ranked[:KEEP]:
+        # Nudge toward vivid AND keep a hard luminance floor. The ring is 10px
+        # of light against a dark desktop: any dark stop makes that stretch of
+        # ring vanish, which reads as a dent in the shape rather than a color.
+        rr, gg, bb = colorsys.hls_to_rgb(h, min(0.72, max(0.52, l)), min(1.0, s * 1.4))
+        out.append("#%02x%02x%02x" % (int(rr * 255), int(gg * 255), int(bb * 255)))
+    return out
+
+
+def main():
+    colors = []
+    tmp = None
+    try:
+        path, tmp_owned = fetch(sys.argv[1] if len(sys.argv) > 1 else "")
+        tmp = path if tmp_owned else None
+        if path and os.path.exists(path):
+            colors = score(swatches(path))
+    except Exception:
+        colors = []
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    print(json.dumps({"colors": colors}))
+
+
+if __name__ == "__main__":
+    main()
