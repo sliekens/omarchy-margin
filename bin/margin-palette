@@ -5,15 +5,25 @@ usage: margin-palette <http(s)://... | file://... | /path>
 Prints {"colors":["#rrggbb", ...]} — 4 colors, most ring-worthy first.
 Exits 0 with an empty list rather than failing, so the ring can fall back
 to theme colors without special-casing errors in QML.
+
+The argument is untrusted. MPRIS metadata is published by whatever happens to
+be playing — a browser tab is an MPRIS player, so a web page can choose this
+URL. Everything below treats it as hostile input: the fetch will not touch a
+non-public address, and the decoder is pinned to a real image format so the
+bytes never reach an ImageMagick delegate.
 """
 
 import colorsys
+import http.client
+import ipaddress
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -22,29 +32,179 @@ KEEP = 4
 MIN_LUM, MAX_LUM = 0.18, 0.95
 MIN_SAT = 0.10
 
+MAX_BYTES = 8 * 1024 * 1024
+MAX_REDIRECTS = 3
+FETCH_TIMEOUT = 6
+ALLOWED_SCHEMES = ("http", "https")
+
+# Magic bytes -> the ImageMagick coder we will name explicitly. Anything not
+# on this list never reaches `magick` at all.
+SNIFFERS = (
+    (b"\x89PNG\r\n\x1a\n", "PNG"),
+    (b"\xff\xd8\xff", "JPEG"),
+    (b"GIF87a", "GIF"),
+    (b"GIF89a", "GIF"),
+    (b"BM", "BMP"),
+)
+
+
+def coder_for(path):
+    """The format named by the file's magic bytes, or None if it isn't one.
+
+    Sniffing here and passing `FORMAT:path` means ImageMagick is told what to
+    decode instead of inferring it from content or extension. That closes the
+    delegate paths — Ghostscript for EPS/PDF/PS, the MVG and MSL script
+    coders — which is where crafted "images" turn into command execution.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(16)
+    except OSError:
+        return None
+    for magic, coder in SNIFFERS:
+        if head.startswith(magic):
+            return coder
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "WEBP"
+    return None
+
+
+def is_public(addr):
+    """True only for a globally routable address.
+
+    Blocks loopback, RFC1918, link-local (169.254.0.0/16 covers the cloud
+    metadata endpoint), CGNAT, multicast, reserved and unspecified.
+
+    is_global carries the IANA special-purpose registry, which is what
+    excludes CGNAT (100.64.0.0/10) — is_private does not, since 3.13. The
+    explicit checks stay because is_global alone admits the NAT64 prefix
+    64:ff9b::/96, and 64:ff9b::7f00:1 is a route to loopback.
+    """
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return ip.is_global and not (
+        ip.is_private or ip.is_loopback or ip.is_link_local
+        or ip.is_multicast or ip.is_reserved or ip.is_unspecified)
+
+
+def resolve_public(host, port):
+    """(family, sockaddr) of the first public address for host, or None."""
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return None
+    for family, _, _, _, sockaddr in infos:
+        if is_public(sockaddr[0]):
+            return family, sockaddr
+    return None
+
+
+class PinnedHTTPConnection(http.client.HTTPConnection):
+    """Connects to a vetted address instead of re-resolving the hostname.
+
+    Checking the name and then letting the socket look it up again leaves a
+    window where a second DNS answer swaps the public address for 127.0.0.1
+    (DNS rebinding). Connecting to the address we actually vetted removes it.
+    """
+
+    def connect(self):
+        resolved = resolve_public(self.host, self.port)
+        if resolved is None:
+            raise urllib.error.URLError(
+                "refusing to connect to non-public host %r" % self.host)
+        family, sockaddr = resolved
+        self.sock = socket.socket(family, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(sockaddr)
+
+
+class PinnedHTTPSConnection(PinnedHTTPConnection, http.client.HTTPSConnection):
+    def connect(self):
+        PinnedHTTPConnection.connect(self)
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
+
+
+class PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(PinnedHTTPConnection, req)
+
+
+class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(PinnedHTTPSConnection, req, context=self._context)
+
+
+class StrictRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keeps redirects on http(s) and bounded in number.
+
+    Each hop still opens through the pinned connection above, so a redirect
+    cannot reach an internal address either; this only stops the scheme from
+    changing under us (urllib would otherwise follow ftp://).
+    """
+
+    max_redirections = MAX_REDIRECTS
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlsplit(newurl).scheme not in ALLOWED_SCHEMES:
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def download(src):
+    """Fetch src to a temp file and return its path, or None."""
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),   # a proxy would bypass the pinning
+        PinnedHTTPHandler(),
+        PinnedHTTPSHandler(),
+        StrictRedirectHandler(),
+    )
+    req = urllib.request.Request(src, headers={"User-Agent": "margin/0.1"})
+    fd, path = tempfile.mkstemp(prefix="margin-art-")
+    try:
+        with opener.open(req, timeout=FETCH_TIMEOUT) as r, os.fdopen(fd, "wb") as f:
+            f.write(r.read(MAX_BYTES))
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return None
+    return path
+
 
 def fetch(src):
-    """Return a local path for src, or None. Caller owns cleanup of temps."""
-    if src.startswith("file://"):
-        return urllib.parse.unquote(urllib.parse.urlparse(src).path), False
-    if src.startswith("/"):
+    """Return (local path, we_own_it) for src, or (None, False)."""
+    scheme = urllib.parse.urlsplit(src).scheme
+    if scheme in ALLOWED_SCHEMES:
+        return download(src), True
+    if scheme == "file":
+        return urllib.parse.unquote(urllib.parse.urlsplit(src).path), False
+    if not scheme and src.startswith("/"):
         return src, False
-    if src.startswith("http://") or src.startswith("https://"):
-        fd, path = tempfile.mkstemp(prefix="margin-art-")
-        os.close(fd)
-        req = urllib.request.Request(src, headers={"User-Agent": "margin/0.1"})
-        with urllib.request.urlopen(req, timeout=6) as r, open(path, "wb") as f:
-            f.write(r.read(8 * 1024 * 1024))
-        return path, True
     return None, False
 
 
-def swatches(path):
+def swatches(path, coder):
     """(weight, r, g, b) per quantized color, via ImageMagick's histogram."""
     out = subprocess.run(
-        # Quantize in LAB (perceptual clustering), then convert back to sRGB
-        # BEFORE reading the histogram — otherwise the tuples come out as LAB.
-        ["magick", path + "[0]", "-resize", "120x120>",
+        # -limit applies in argument order, so the bounds have to precede the
+        # input: the 8 MiB download cap says nothing about what those bytes
+        # decompress to, and a gigapixel bomb is a few KB on the wire.
+        ["magick",
+         "-limit", "area", "32MP",       # refuse rather than page to disk
+         "-limit", "memory", "128MiB",
+         "-limit", "map", "256MiB",
+         "-limit", "disk", "0",          # no disk-backed pixel cache
+         "-limit", "time", "8",
+         "-limit", "thread", "1",
+         coder + ":" + path + "[0]",
+         "-resize", "120x120>",
+         # Quantize in LAB (perceptual clustering), then convert back to sRGB
+         # BEFORE reading the histogram — otherwise the tuples come out as LAB.
          "-quantize", "LAB", "-colors", str(SWATCHES),
          "-colorspace", "sRGB", "-depth", "8",
          "-format", "%c", "histogram:info:-"],
@@ -89,8 +249,11 @@ def main():
     try:
         path, tmp_owned = fetch(sys.argv[1] if len(sys.argv) > 1 else "")
         tmp = path if tmp_owned else None
-        if path and os.path.exists(path):
-            colors = score(swatches(path))
+        if (path and os.path.isabs(path) and os.path.isfile(path)
+                and os.path.getsize(path) <= MAX_BYTES):
+            coder = coder_for(path)
+            if coder:
+                colors = score(swatches(path, coder))
     except Exception:
         colors = []
     finally:

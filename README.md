@@ -191,6 +191,41 @@ beat: that alone took the ring from 3% to 16% of a core. The beat now drives
 opacity, which costs nothing, and the contour rebuilds on a 30fps tick fed by
 the producer's 43fps frames.
 
+## Handling album art safely
+
+The one input Margin does not control is the album-art URL. It comes from
+MPRIS metadata, which is published by whatever happens to be playing — and a
+browser tab is an MPRIS player, so a web page can choose that URL. Anything
+`bin/margin-palette` does with it has to assume it was chosen adversarially.
+
+Two properties follow, and `test/security_test.py` holds both:
+
+- **It will not open a connection to a non-public address.** The hostname is
+  resolved and checked against the IANA special-purpose ranges (loopback,
+  RFC1918, CGNAT, link-local — which covers cloud metadata endpoints —
+  multicast, reserved), then the socket connects to *that vetted address*
+  rather than re-resolving the name, so a second DNS answer cannot swap it for
+  an internal one. Redirects are capped at 3, kept on http(s), and each hop
+  goes through the same check. Proxies are disabled, since one would sit in
+  front of the pinning.
+- **Fetched bytes never reach an ImageMagick delegate, and cannot allocate
+  without bound.** The file's magic bytes are sniffed first and the decoder is
+  named explicitly (`PNG:`, `JPEG:`, `GIF:`, `WEBP:`, `BMP:`), so ImageMagick
+  is told what to decode instead of inferring it — that is what keeps a
+  crafted file away from the EPS/PDF and MVG/MSL script coders. `-limit`
+  bounds area, memory, map, disk, time and threads before the input is opened,
+  because the 8 MiB download cap says nothing about what those bytes
+  decompress to: a valid 25000×25000 PNG is 74 KB on the wire and 4.8 GB of
+  pixel cache. It is now refused in 5 ms.
+
+Failures stay silent by design — the palette comes back empty and the ring
+falls back to theme colours, so a hostile URL is indistinguishable from a
+track with no art.
+
+```bash
+python3 test/security_test.py
+```
+
 ## Known limits
 
 - **Hot-reload serves stale QML.** Editing `Margin.qml` triggers a reload that
