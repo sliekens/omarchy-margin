@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Margin audio producer.
 
-Taps the default sink's monitor with parec, computes a log-spaced spectrum
+Taps the default sink's monitor with pw-cat, computes a log-spaced spectrum
 and a beat flag, and writes one compact JSON object per frame to stdout.
 
 Output (one line per frame, ~43/sec):
@@ -109,17 +109,18 @@ def band_edges():
 def open_capture():
     global _child
     _reap()
-    recorder = shutil.which("parec")
+    recorder = shutil.which("pw-cat")
     if not recorder:
-        sys.stderr.write("margin-audio: parec is required to capture the "
+        sys.stderr.write("margin-audio: pw-cat is required to capture the "
                          "default sink monitor\n")
         sys.exit(1)
-    # @DEFAULT_MONITOR@ is resolved by the Pulse server specifically as the
-    # default sink's monitor. Unlike pw-cat with an unresolved target, parec
-    # fails instead of silently connecting to the default microphone.
-    cmd = [recorder, "--record", "--device=@DEFAULT_MONITOR@",
-           "--format=s16le", "--rate=%d" % RATE, "--channels=1",
-           "--latency-msec=20", "--raw"]
+    # This changes WirePlumber's target class from Audio/Source to Audio/Sink,
+    # whose monitor ports carry the output mix. Automatic routing can therefore
+    # select the default sink, but never a microphone.
+    cmd = [recorder, "--record",
+           '--properties={"stream.capture.sink":true}',
+           "--format=s16", "--rate=%d" % RATE, "--channels=1",
+           "--latency=20ms", "--raw", "-"]
     _child = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                               stderr=subprocess.DEVNULL)
     return _child

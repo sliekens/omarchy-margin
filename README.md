@@ -28,13 +28,13 @@ unsandboxed inside your long-lived `omarchy-shell` process. Update with
 `omarchy plugin update sliekens.margin`, remove with `omarchy plugin remove
 sliekens.margin`.
 
-Requires nothing beyond a stock Omarchy box: `parec` (pipewire-pulse), `magick`
+Requires nothing beyond a stock Omarchy box: `pw-cat` (pipewire), `magick`
 (imagemagick), `hyprctl`, and the Python 3 standard library.
 
 ## How it works
 
 ```
-bin/margin-audio   parec taps the default sink's monitor -> FFT -> 28 log
+bin/margin-audio   pw-cat taps the default sink's monitor -> FFT -> 28 log
                    bands + spectral-flux beat detection + noise gate -> one
                    JSON line per frame (~43/sec) on stdout
 bin/margin-palette MPRIS trackArtUrl -> ImageMagick quantize -> 4 ring colors
@@ -68,7 +68,7 @@ reserves space.
 
 ## Dependencies
 
-None beyond a stock Omarchy box: `parec` (pipewire-pulse), `magick`
+None beyond a stock Omarchy box: `pw-cat` (pipewire), `magick`
 (imagemagick), `hyprctl`, python3 stdlib. No cava, no numpy.
 
 ## Config
@@ -167,7 +167,7 @@ omarchy-shell margin repalette  # re-extract colors from the current art
 - Cost: producer ~2% of one core; ring ~3-4% (measured over 8s windows
   against the shell with `enabled: false` as baseline, which reads 0%).
 - Kill the producer → watchdog restarts it within 1s.
-- The `parec` child is reaped on exit, so reloads don't orphan capture processes.
+- The `pw-cat` child is reaped on exit, so reloads don't orphan capture processes.
 
 ## Three things worth knowing
 
@@ -178,12 +178,11 @@ mute. Silence detection can never cover this. The plugin reads
 `Pipewire.defaultAudioSink.audio.muted` (and treats volume 0 the same) and,
 while muted, hides the ring *and* stops the capture process entirely.
 
-**Bind capture to the output monitor explicitly.** An unresolved `pw-cat`
-target silently falls back to the default source, which is usually the
-**microphone**. Margin instead asks pipewire-pulse's `parec` for
-`@DEFAULT_MONITOR@`. The server resolves that specifically to the default
-sink's monitor and fails the stream if no monitor exists; it never substitutes
-the default input source.
+**Declare sink capture explicitly.** A normal PipeWire recording stream is
+routed to an `Audio/Source`, usually the **microphone**. Margin gives `pw-cat`
+the native `stream.capture.sink=true` property, which tells WirePlumber to
+route it to an `Audio/Sink` instead. WirePlumber selects the default output and
+links its monitor ports; a microphone is not a compatible target.
 
 **Keep animation out of the geometry.** Letting the beat pulse modulate the
 contour meant re-triangulating a 160-point path at 60fps for 400ms after every

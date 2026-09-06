@@ -29,22 +29,23 @@ class CaptureTests(unittest.TestCase):
         child = mock.Mock()
         child.poll.return_value = 0
         with mock.patch.object(self.audio.shutil, "which",
-                               return_value="/usr/bin/parec"), \
+                               return_value="/usr/bin/pw-cat"), \
                 mock.patch.object(self.audio.subprocess, "Popen",
                                   return_value=child) as popen:
             self.assertIs(self.audio.open_capture(), child)
 
         self.assertEqual(popen.call_args.args[0], [
-            "/usr/bin/parec", "--record", "--device=@DEFAULT_MONITOR@",
-            "--format=s16le", "--rate=22050", "--channels=1",
-            "--latency-msec=20", "--raw",
+            "/usr/bin/pw-cat", "--record",
+            '--properties={"stream.capture.sink":true}',
+            "--format=s16", "--rate=22050", "--channels=1",
+            "--latency=20ms", "--raw", "-",
         ])
         self.assertEqual(popen.call_args.kwargs, {
             "stdout": subprocess.PIPE,
             "stderr": subprocess.DEVNULL,
         })
 
-    def test_stops_when_parec_is_unavailable(self):
+    def test_stops_when_pw_cat_is_unavailable(self):
         with mock.patch.object(self.audio.shutil, "which", return_value=None), \
                 mock.patch.object(self.audio.subprocess, "Popen") as popen, \
                 mock.patch.object(self.audio.sys, "stderr", new=io.StringIO()):
