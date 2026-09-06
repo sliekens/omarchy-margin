@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Margin audio producer.
 
-Taps the default sink's monitor with pw-cat, computes a log-spaced spectrum
+Taps the default sink's monitor with parec, computes a log-spaced spectrum
 and a beat flag, and writes one compact JSON object per frame to stdout.
 
 Output (one line per frame, ~43/sec):
@@ -27,7 +27,7 @@ _child = None
 def _reap(*_args):
     """Kill the capture child on the way out.
 
-    Without this, every plugin reload orphans a pw-cat still holding the
+    Without this, every plugin reload orphans a recorder still holding the
     monitor open, and they accumulate for the life of the session.
     """
     global _child
@@ -106,50 +106,20 @@ def band_edges():
     return edges
 
 
-def sink_node_id():
-    """PipeWire node id of the default sink.
-
-    There is no separate node for a monitor in PipeWire: you capture a sink's
-    monitor by targeting the sink itself. The `<sink>.monitor` name is a
-    PulseAudio-ism, and passing it to pw-cat does not match anything — pw-cat
-    then falls back to the DEFAULT SOURCE, which is the microphone. That is
-    both wrong and a privacy problem, so this resolves a real id or nothing.
-    """
-    try:
-        sink = subprocess.run(["pactl", "get-default-sink"], capture_output=True,
-                              text=True, timeout=3).stdout.strip()
-        if not sink:
-            return None, None
-        dump = json.loads(subprocess.run(["pw-dump"], capture_output=True,
-                                         text=True, timeout=5).stdout)
-        for obj in dump:
-            props = ((obj.get("info") or {}).get("props") or {})
-            if (props.get("media.class") == "Audio/Sink"
-                    and props.get("node.name") == sink):
-                return obj.get("id"), sink
-        return None, sink
-    except Exception:
-        return None, None
-
-
 def open_capture():
     global _child
     _reap()
-    node_id, sink = sink_node_id()
-    if node_id is not None:
-        cmd = ["pw-cat", "--record", "--target", str(node_id),
-               "--rate", str(RATE), "--channels", "1", "--format", "s16",
-               "--latency", "20ms", "--raw", "-"]
-    elif sink and shutil.which("parec"):
-        # parec resolves the PulseAudio monitor name directly.
-        cmd = ["parec", "--format=s16le", "--rate=%d" % RATE, "--channels=1",
-               "-d", sink + ".monitor"]
-    else:
-        # Deliberately fatal: capturing an unresolved default source would mean
-        # visualising the microphone. Better to show nothing than to do that.
-        sys.stderr.write("margin-audio: cannot resolve the default sink's "
-                         "monitor; refusing to capture an unknown source\n")
+    recorder = shutil.which("parec")
+    if not recorder:
+        sys.stderr.write("margin-audio: parec is required to capture the "
+                         "default sink monitor\n")
         sys.exit(1)
+    # @DEFAULT_MONITOR@ is resolved by the Pulse server specifically as the
+    # default sink's monitor. Unlike pw-cat with an unresolved target, parec
+    # fails instead of silently connecting to the default microphone.
+    cmd = [recorder, "--record", "--device=@DEFAULT_MONITOR@",
+           "--format=s16le", "--rate=%d" % RATE, "--channels=1",
+           "--latency-msec=20", "--raw"]
     _child = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                               stderr=subprocess.DEVNULL)
     return _child
@@ -189,7 +159,7 @@ def main():
     source = sys.stdin.buffer if use_stdin else proc.stdout
     while True:
         raw = read_exact(source, N * 2)
-        if raw is None:                       # sink changed or pw-cat died
+        if raw is None:                       # sink changed or recorder died
             if use_stdin:
                 break
             time.sleep(0.5)

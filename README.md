@@ -28,13 +28,13 @@ unsandboxed inside your long-lived `omarchy-shell` process. Update with
 `omarchy plugin update sliekens.margin`, remove with `omarchy plugin remove
 sliekens.margin`.
 
-Requires nothing beyond a stock Omarchy box: `pw-cat` (pipewire), `magick`
+Requires nothing beyond a stock Omarchy box: `parec` (pipewire-pulse), `magick`
 (imagemagick), `hyprctl`, and the Python 3 standard library.
 
 ## How it works
 
 ```
-bin/margin-audio   pw-cat taps the default sink's monitor -> FFT -> 28 log
+bin/margin-audio   parec taps the default sink's monitor -> FFT -> 28 log
                    bands + spectral-flux beat detection + noise gate -> one
                    JSON line per frame (~43/sec) on stdout
 bin/margin-palette MPRIS trackArtUrl -> ImageMagick quantize -> 4 ring colors
@@ -68,7 +68,7 @@ reserves space.
 
 ## Dependencies
 
-None beyond a stock Omarchy box: `pw-cat` (pipewire), `magick`
+None beyond a stock Omarchy box: `parec` (pipewire-pulse), `magick`
 (imagemagick), `hyprctl`, python3 stdlib. No cava, no numpy.
 
 ## Config
@@ -155,10 +155,10 @@ omarchy-shell margin repalette  # re-extract colors from the current art
 
 - Beat detection regression: synthetic 120 BPM click track → 23/24 beats,
   0.501s mean interval. Live: 129 BPM on a 127 BPM track.
-- Capture is bound to the sink monitor (source 56), not the mic (58).
+- Capture is bound to the sink monitor, not the mic.
 - Silence in → zeros out: all bands 0, no beats, ring fades out.
 - Muted → nothing drawn at all: two frames 1.5s apart are pixel-identical
-  across the gap, the producer and its pw-cat both exit, shell CPU reads 0%.
+  across the gap, the producer and its recorder both exit, shell CPU reads 0%.
 - The mute/unmute transition animates rather than cutting: captured at full,
   mid-retraction and gone, the ring is a bright band, a bright narrower band,
   then nothing. Steady-state CPU is unchanged by it.
@@ -167,7 +167,7 @@ omarchy-shell margin repalette  # re-extract colors from the current art
 - Cost: producer ~2% of one core; ring ~3-4% (measured over 8s windows
   against the shell with `enabled: false` as baseline, which reads 0%).
 - Kill the producer → watchdog restarts it within 1s.
-- `pw-cat` child is reaped on exit, so reloads don't orphan capture processes.
+- The `parec` child is reaped on exit, so reloads don't orphan capture processes.
 
 ## Three things worth knowing
 
@@ -178,12 +178,12 @@ mute. Silence detection can never cover this. The plugin reads
 `Pipewire.defaultAudioSink.audio.muted` (and treats volume 0 the same) and,
 while muted, hides the ring *and* stops the capture process entirely.
 
-**Never let pw-cat pick its own source.** PipeWire has no separate node for a
-monitor: you capture a sink's monitor by targeting the *sink itself*. The
-`<sink>.monitor` name is a PulseAudio-ism, and passing it to `pw-cat --target`
-matches nothing — pw-cat then silently falls back to the default source, which
-is the **microphone**. `sink_node_id()` resolves a real node id and the code
-exits rather than capturing an unresolved source.
+**Bind capture to the output monitor explicitly.** An unresolved `pw-cat`
+target silently falls back to the default source, which is usually the
+**microphone**. Margin instead asks pipewire-pulse's `parec` for
+`@DEFAULT_MONITOR@`. The server resolves that specifically to the default
+sink's monitor and fails the stream if no monitor exists; it never substitutes
+the default input source.
 
 **Keep animation out of the geometry.** Letting the beat pulse modulate the
 contour meant re-triangulating a 160-point path at 60fps for 400ms after every
@@ -223,6 +223,7 @@ falls back to theme colours, so a hostile URL is indistinguishable from a
 track with no art.
 
 ```bash
+python3 test/test_audio.py
 python3 test/security_test.py
 ```
 
