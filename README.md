@@ -34,9 +34,10 @@ Requires nothing beyond a stock Omarchy box: `pw-cat` (pipewire), `magick`
 ## How it works
 
 ```
-bin/margin-audio   pw-cat taps the default sink's monitor -> FFT -> 28 log
-                   bands + spectral-flux beat detection + noise gate -> one
-                   JSON line per frame (~43/sec) on stdout
+bin/margin-audio   pw-cat records with stream.capture.sink=true so WirePlumber
+                   links the default sink's monitor (never a mic) -> FFT ->
+                   28 log bands + spectral-flux beat detection + noise gate ->
+                   one JSON line per frame (~43/sec) on stdout
 bin/margin-palette MPRIS trackArtUrl -> ImageMagick quantize -> 4 ring colors
 Margin.qml         layer-shell surface per screen, inset by the bar's reserved
                    area so it lands exactly in the gap; one continuous Shape
