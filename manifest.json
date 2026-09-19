@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "sliekens.margin",
   "name": "Margin",
-  "version": "0.1.0",
+  "version": "1.0.1",
   "author": "Steven Liekens",
   "description": "Fills the window gap around your screen edge with a music visualiser: a ring coloured from the current track's album art that sweeps on the beat.",
   "kinds": [
