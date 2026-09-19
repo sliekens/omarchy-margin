@@ -155,10 +155,10 @@ omarchy-shell margin repalette  # re-extract colors from the current art
 
 - Beat detection regression: synthetic 120 BPM click track → 23/24 beats,
   0.501s mean interval. Live: 129 BPM on a 127 BPM track.
-- Capture is bound to the sink monitor (source 56), not the mic (58).
+- Capture is bound to the sink monitor, not the mic.
 - Silence in → zeros out: all bands 0, no beats, ring fades out.
 - Muted → nothing drawn at all: two frames 1.5s apart are pixel-identical
-  across the gap, the producer and its pw-cat both exit, shell CPU reads 0%.
+  across the gap, the producer and its recorder both exit, shell CPU reads 0%.
 - The mute/unmute transition animates rather than cutting: captured at full,
   mid-retraction and gone, the ring is a bright band, a bright narrower band,
   then nothing. Steady-state CPU is unchanged by it.
@@ -167,7 +167,7 @@ omarchy-shell margin repalette  # re-extract colors from the current art
 - Cost: producer ~2% of one core; ring ~3-4% (measured over 8s windows
   against the shell with `enabled: false` as baseline, which reads 0%).
 - Kill the producer → watchdog restarts it within 1s.
-- `pw-cat` child is reaped on exit, so reloads don't orphan capture processes.
+- The `pw-cat` child is reaped on exit, so reloads don't orphan capture processes.
 
 ## Three things worth knowing
 
@@ -178,12 +178,11 @@ mute. Silence detection can never cover this. The plugin reads
 `Pipewire.defaultAudioSink.audio.muted` (and treats volume 0 the same) and,
 while muted, hides the ring *and* stops the capture process entirely.
 
-**Never let pw-cat pick its own source.** PipeWire has no separate node for a
-monitor: you capture a sink's monitor by targeting the *sink itself*. The
-`<sink>.monitor` name is a PulseAudio-ism, and passing it to `pw-cat --target`
-matches nothing — pw-cat then silently falls back to the default source, which
-is the **microphone**. `sink_node_id()` resolves a real node id and the code
-exits rather than capturing an unresolved source.
+**Declare sink capture explicitly.** A normal PipeWire recording stream is
+routed to an `Audio/Source`, usually the **microphone**. Margin gives `pw-cat`
+the native `stream.capture.sink=true` property, which tells WirePlumber to
+route it to an `Audio/Sink` instead. WirePlumber selects the default output and
+links its monitor ports; a microphone is not a compatible target.
 
 **Keep animation out of the geometry.** Letting the beat pulse modulate the
 contour meant re-triangulating a 160-point path at 60fps for 400ms after every
@@ -223,6 +222,7 @@ falls back to theme colours, so a hostile URL is indistinguishable from a
 track with no art.
 
 ```bash
+python3 test/test_audio.py
 python3 test/security_test.py
 ```
 
